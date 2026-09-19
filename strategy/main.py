@@ -45,7 +45,7 @@ import random
 #  on means roughly half the tournament is played by the sparring partner.
 #  It prints a loud warning into the gamelog on every handshake while it is on.
 # ═══════════════════════════════════════════════════════════════════════════════
-SPARRING_MODE = True
+SPARRING_MODE = False
 
 # ───────────────────────────────── tuning ──────────────────────────────────────
 # Everything here is a preference; every *rule* comes from `get_config()`.
