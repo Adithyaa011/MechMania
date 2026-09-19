@@ -1,21 +1,3 @@
-"""MechMania 32 combat-first strategy.
-
-Replacement preserving the supplied engine API and local tuning commands.
-Uses staged economy, threat-based defense, obstacle-aware targeting and
-reachable healer assignments. Match performance must be checked in the engine.
-
-Revision notes, from reading friendly logs 1074 and 1026 tick by tick:
-
-  * The supplied 1368 and 1414 logs are identical match data apart from elapsed time.
-    Team B grew to seven extractors, team A held three, then B amassed a full fleet.
-    This version expands economy in stages toward the eight-extractor cap.
-  * Gang (log 1026) self-destructed all eight of its extractors at full health on tick
-    5836 and spent a 1375-token bank on battle bots, entering the endgame 22/10/0 while
-    Boneyard Creek carried four miners that cannot shoot.  It then wiped them for an
-    elimination win from BEHIND on capture (+0.567 against it).  Tokens buy nothing
-    after the endgame line and an extractor is a body that cannot fire, so the same
-    conversion is now ours: see `_convert_miners`.
-"""
 
 from __future__ import annotations
 
@@ -36,22 +18,6 @@ import os as _os
 import random
 from dataclasses import asdict, dataclass, fields
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LOCAL TESTING SWITCH -- READ THIS BEFORE YOU SUBMIT
-# ═══════════════════════════════════════════════════════════════════════════════
-#  `mm-cli run` plays the bot against itself, so with one strategy both sides make
-#  the same decisions and the match tells you nothing.  While this is True, team 1
-#  runs `sparring_strategy` instead -- a deliberately mediocre, randomised bot -- so
-#  a local match measures whether the real strategy actually wins.
-#
-#  SET IT TO False BEFORE `mm-cli submit`.  The engine mirrors the world for the
-#  top-right team, so in a real match both sides must run `Brain.act`; leaving this
-#  on means roughly half the tournament is played by the sparring partner.
-#
-#  The tuner needs it False as well: it plays candidate against candidate, and the
-#  sparring partner is only one of its opponents.  `selftest` refuses to run with
-#  this on.
-# ═══════════════════════════════════════════════════════════════════════════════
 SPARRING_MODE = False
 
 
