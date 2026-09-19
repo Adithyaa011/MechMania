@@ -2,117 +2,396 @@ from . import *
 
 
 def get_strategy(team: int) -> Strategy:
-    """This function tells the engine what strategy you want your bot to use."""
+    """
+    Both teams use the same strategy.
 
-    # team == 0 means I am bottom left
-    # team == 1 means I am top right
+    The engine mirrors the world for the top-right team,
+    so the strategy can always think of itself as being
+    on the bottom-left side.
+    """
 
     if team == 0:
-        print("Hello! I am team A (on the bottom left)")
-        return basic_strategy
+        print("Hello! I am team A (bottom left)")
     else:
-        print("Hello! I am team B (on the top right)")
-        return do_nothing
+        print("Hello! I am team B (top right)")
 
-    # NOTE when actually submitting your bot, you probably want to have the SAME strategy
-    # for both sides: the engine mirrors the world for the top-right team, so there is
-    # nothing for a side to specialise in.
+    return improved_strategy
 
-def do_nothing(state: GameState) -> FleetAction:
-    """The smallest strategy there is: issue no orders at all."""
-    return FleetAction.new()
 
-def basic_strategy(state: GameState) -> FleetAction:
-    """Assign one bot to extract from our deposit, one bot to hold the payload, and send
-    every remaining bot after the nearest enemy."""
+def get_closest_enemy(bot, state):
+    """
+    Return the BotState of the enemy closest to this bot.
 
-    # NOTE `get_config()` is the whole rulebook for this match -- bot stats, payload
-    # speed, deposit layout, fabricator prices, the map. It is fixed for the match and
-    # available from the first tick, so read it instead of hardcoding numbers: the values
-    # below are tuned between seasons and your bot picks up the change for free.
+    Returns None if there are no enemies.
+    """
+
+    closest_enemy = None
+    closest_distance = float("inf")
+
+    for enemy in state.fleet_other:
+
+        distance = bot.pos.dist_sq(enemy.pos)
+
+        if distance < closest_distance:
+            closest_distance = distance
+            closest_enemy = enemy
+
+    return closest_enemy
+
+
+def get_enemy_near_position(position, state):
+    """
+    Find the enemy closest to a strategic position.
+
+    This is used for:
+        - our deposit
+        - the payload
+    """
+
+    closest_enemy = None
+    closest_distance = float("inf")
+
+    for enemy in state.fleet_other:
+
+        distance = position.dist_sq(enemy.pos)
+
+        if distance < closest_distance:
+            closest_distance = distance
+            closest_enemy = enemy
+
+    return closest_enemy
+
+
+def choose_target(bot, state):
+    """
+    Choose an enemy based on tactical priority.
+
+    Priority:
+        1. Enemy threatening our deposit
+        2. Enemy threatening the payload
+        3. Enemy closest to our bot
+    """
+
+    deposit_position = state.deposit_me.pos
+    payload_position = state.payload_pos()
+
+    # ---------------------------------------------------------
+    # Priority 1: Protect our deposit
+    # ---------------------------------------------------------
+
+    deposit_enemy = get_enemy_near_position(
+        deposit_position,
+        state
+    )
+
+    if deposit_enemy is not None:
+
+        deposit_distance = deposit_position.dist(
+            deposit_enemy.pos
+        )
+
+        # Enemy is close enough to threaten the extractor.
+        if deposit_distance <= 10.0:
+            return deposit_enemy
+
+    # ---------------------------------------------------------
+    # Priority 2: Contest the payload
+    # ---------------------------------------------------------
+
+    payload_enemy = get_enemy_near_position(
+        payload_position,
+        state
+    )
+
+    if payload_enemy is not None:
+
+        payload_distance = payload_position.dist(
+            payload_enemy.pos
+        )
+
+        if payload_distance <= 10.0:
+            return payload_enemy
+
+    # ---------------------------------------------------------
+    # Priority 3: Attack closest enemy
+    # ---------------------------------------------------------
+
+    return get_closest_enemy(
+        bot,
+        state
+    )
+
+
+def move_towards(bot, target):
+    """
+    Navigate the bot toward a target while accounting for walls.
+    """
+
+    if target is None:
+        return None
+
+    return move_bot(
+        navigate_to(
+            bot.pos,
+            target
+        )
+    )
+
+
+def get_battle_action(bot, enemy, conf):
+    """
+    Decide whether the battle bot should fire.
+
+    The bot fires only when:
+        - enemy is within range
+        - line of sight is clear
+    """
+
+    if enemy is None:
+        return SpecialAction.Battle(
+            fire=False
+        )
+
+    distance = bot.pos.dist(
+        enemy.pos
+    )
+
+    can_fire = (
+        distance <= conf.bot.blaster_range
+        and line_of_sight(
+            bot.pos,
+            enemy.pos
+        )
+    )
+
+    return SpecialAction.Battle(
+        fire=can_fire
+    )
+
+
+def improved_strategy(state: GameState) -> FleetAction:
+
+    # ---------------------------------------------------------
+    # Get fixed match configuration
+    # ---------------------------------------------------------
+
     conf = get_config()
 
-    # NOTE Do not worry about what side your bot is on!
-    # The engine mirrors the world for you if you are on top,
-    # so to you, you are always on the bottom left. Your fleet is always `fleet_me`.
-
+    # Create an empty action for the fleet.
     action = FleetAction.new()
 
+    # Current payload position.
     payload = state.payload_pos()
 
-    # make a battle bot by default
+    # ---------------------------------------------------------
+    # Decide what the fabricator should build
+    # ---------------------------------------------------------
+
+    # Default:
+    # Build Battle bots.
     next_bot = BotClass.Battle
 
-    # `next_bot_creation: 0` means both fleets' very first build is always a Extractor
-    # (the engine's own default), and that first bot always lands in slot 0 -- so bot id 0
-    # missing means our extractor died and the fabricator should replace it before anything
+    # Bot ID 0 is our extractor.
+    #
+    # If it is missing, rebuild an Extractor before anything
     # else.
     if not state.fleet_me.get(0):
         next_bot = BotClass.Extractor
 
-    # The deposit is a solid disc, so standing dead-center is not the mining spot. This is
-    # the closest legal spot on our own edge of the ring: hull to hull with it, `+y` being
-    # the side away from the map center on our half.
-    #
-    # You do not actually have to hug the ring -- an extractor mines anything within
-    # `conf.bot.base_extract_range` that it has a sightline to (`line_of_sight`), and only
-    # walls block that ray, not bots. Standing back is safer.
-    mining_spot = state.deposit_me.pos + Vec2(0.0, conf.deposit.radius + conf.bot.radius)
+    # ---------------------------------------------------------
+    # Calculate extractor mining position
+    # ---------------------------------------------------------
 
-    assigned_contester = False
+    mining_spot = (
+        state.deposit_me.pos
+        + Vec2(
+            0.0,
+            conf.deposit.radius + conf.bot.radius
+        )
+    )
+
+    # Only one bot should initially be assigned to the payload.
+    payload_bot_assigned = False
+
+    # ---------------------------------------------------------
+    # Process every living bot
+    # ---------------------------------------------------------
 
     for bot in state.fleet_me:
 
-        # `fleet_me` iterates the bots you actually have -- dead slots are skipped, so there
-        # is no mask to check and no empty slot to guard against. `FleetAction.bots` is
-        # indexed by bot id, and a bot's id is its slot.
         bot_action = action.bots[bot.id]
 
+        # =====================================================
+        # ROLE 1: EXTRACTOR
+        # =====================================================
+
         if bot.class_ == BotClass.Extractor:
-            bot_action.move_action = move_bot(navigate_to(bot.pos, mining_spot))
-            bot_action.turn_action = turn_towards(state.deposit_me.pos)
-            bot_action.special_action = SpecialAction.Extractor(mine=True)
+
+            # Move toward our deposit.
+            bot_action.move_action = move_bot(
+                navigate_to(
+                    bot.pos,
+                    mining_spot
+                )
+            )
+
+            # Face the deposit.
+            bot_action.turn_action = turn_towards(
+                state.deposit_me.pos
+            )
+
+            # Mine.
+            bot_action.special_action = (
+                SpecialAction.Extractor(
+                    mine=True
+                )
+            )
+
             continue
 
-        if not assigned_contester:
-            # NOTE You do not have to write a pathfinder. `navigate_to` walks around walls
-            # for you, using a map of the arena the engine works out before the match
-            # starts. Call it every tick with where the bot is now -- it is one step, not a
-            # plan, so it re-routes by itself as things move.
-            #
-            # `payload - bot.pos` would walk straight at the point and grind into the first
-            # wall in the way.
-            bot_action.move_action = move_bot(navigate_to(bot.pos, payload))
-            assigned_contester = True
+        # =====================================================
+        # ROLE 2: PAYLOAD RUNNER
+        # =====================================================
+
+        if not payload_bot_assigned:
+
+            enemy = choose_target(
+                bot,
+                state
+            )
+
+            # If an enemy is immediately nearby,
+            # fight before blindly walking toward payload.
+            if enemy is not None:
+
+                enemy_distance = bot.pos.dist(
+                    enemy.pos
+                )
+
+                if (
+                    enemy_distance
+                    <= conf.bot.blaster_range * 1.5
+                ):
+
+                    bot_action.move_action = (
+                        move_towards(
+                            bot,
+                            enemy.pos
+                        )
+                    )
+
+                    bot_action.turn_action = (
+                        turn_towards(
+                            enemy.pos
+                        )
+                    )
+
+                    bot_action.special_action = (
+                        get_battle_action(
+                            bot,
+                            enemy,
+                            conf
+                        )
+                    )
+
+                    payload_bot_assigned = True
+
+                    continue
+
+            # No immediate threat:
+            # move toward the payload.
+            bot_action.move_action = (
+                move_towards(
+                    bot,
+                    payload
+                )
+            )
+
+            payload_bot_assigned = True
+
             continue
 
-        # find the closest enemy
-        closest_enemy = None
-        for enemy in state.fleet_other:
-            if closest_enemy is None or bot.pos.dist_sq(enemy.pos) < bot.pos.dist_sq(closest_enemy):
-                closest_enemy = enemy.pos
+        # =====================================================
+        # ROLE 3: COMBAT BOT
+        # =====================================================
 
-        if closest_enemy is None:
-            break
-        bot_action.move_action = move_bot(navigate_to(bot.pos, closest_enemy))
-        bot_action.turn_action = turn_towards(closest_enemy)
+        enemy = choose_target(
+            bot,
+            state
+        )
 
-        # Only pull the trigger when the shot can actually land: in range, and with a wall
-        # free sightline. A shot puts the blaster on `conf.bot.blaster_cooldown` ticks
-        # whether or not it hits anything, so firing at a wall costs you the next real one.
-        in_range = (bot.pos.dist(closest_enemy) <= conf.bot.blaster_range
-                    and line_of_sight(bot.pos, closest_enemy))
-        bot_action.special_action = SpecialAction.Battle(fire=in_range)
+        # -----------------------------------------------------
+        # No enemy exists
+        # -----------------------------------------------------
 
-    action.fabricator_next = int(next_bot)
+        if enemy is None:
 
-    # Rush orders are the only thing tokens buy. Ask for one when we can actually pay
-    # `conf.fabricator.rush_cost`, and not once the endgame has started -- no bot is built
-    # in the last `conf.endgame_ticks` of the match, so the tokens would just sit there.
-    #
-    # Rust's `GameState::in_endgame(conf)` has no Python binding, so spell the phase out.
-    in_endgame = state.tick >= conf.max_ticks - conf.endgame_ticks
-    action.rush_order = (not in_endgame
-                         and state.fabricator_me.tokens >= conf.fabricator.rush_cost)
+            # Instead of doing nothing,
+            # help with the payload.
+            bot_action.move_action = (
+                move_towards(
+                    bot,
+                    payload
+                )
+            )
+
+            continue
+
+        # -----------------------------------------------------
+        # Move toward target
+        # -----------------------------------------------------
+
+        bot_action.move_action = (
+            move_towards(
+                bot,
+                enemy.pos
+            )
+        )
+
+        # -----------------------------------------------------
+        # Aim toward target
+        # -----------------------------------------------------
+
+        bot_action.turn_action = (
+            turn_towards(
+                enemy.pos
+            )
+        )
+
+        # -----------------------------------------------------
+        # Fire if possible
+        # -----------------------------------------------------
+
+        bot_action.special_action = (
+            get_battle_action(
+                bot,
+                enemy,
+                conf
+            )
+        )
+
+    # ---------------------------------------------------------
+    # Fabricator
+    # ---------------------------------------------------------
+
+    action.fabricator_next = int(
+        next_bot
+    )
+
+    # ---------------------------------------------------------
+    # Rush order
+    # ---------------------------------------------------------
+
+    in_endgame = (
+        state.tick
+        >= conf.max_ticks - conf.endgame_ticks
+    )
+
+    action.rush_order = (
+        not in_endgame
+        and
+        state.fabricator_me.tokens
+        >= conf.fabricator.rush_cost
+    )
 
     return action
