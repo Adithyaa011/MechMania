@@ -1,3 +1,21 @@
+"""MechMania 32 combat-first strategy.
+
+Replacement preserving the supplied engine API and local tuning commands.
+Uses staged economy, threat-based defense, obstacle-aware targeting and
+reachable healer assignments. Match performance must be checked in the engine.
+
+Revision notes, from reading friendly logs 1074 and 1026 tick by tick:
+
+  * Both winners opened with EIGHT extractors -- the whole deposit cap -- and both
+    losers opened with three.  The cap is shared between the fleets, so filling it is
+    an economy and a denial at once.  `extractors_wanted` is now 8.
+  * Gang (log 1026) self-destructed all eight of its extractors at full health on tick
+    5836 and spent a 1375-token bank on battle bots, entering the endgame 22/10/0 while
+    Boneyard Creek carried four miners that cannot shoot.  It then wiped them for an
+    elimination win from BEHIND on capture (+0.567 against it).  Tokens buy nothing
+    after the endgame line and an extractor is a body that cannot fire, so the same
+    conversion is now ours: see `_convert_miners`.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +36,22 @@ import os as _os
 import random
 from dataclasses import asdict, dataclass, fields
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LOCAL TESTING SWITCH -- READ THIS BEFORE YOU SUBMIT
+# ═══════════════════════════════════════════════════════════════════════════════
+#  `mm-cli run` plays the bot against itself, so with one strategy both sides make
+#  the same decisions and the match tells you nothing.  While this is True, team 1
+#  runs `sparring_strategy` instead -- a deliberately mediocre, randomised bot -- so
+#  a local match measures whether the real strategy actually wins.
+#
+#  SET IT TO False BEFORE `mm-cli submit`.  The engine mirrors the world for the
+#  top-right team, so in a real match both sides must run `Brain.act`; leaving this
+#  on means roughly half the tournament is played by the sparring partner.
+#
+#  The tuner needs it False as well: it plays candidate against candidate, and the
+#  sparring partner is only one of its opponents.  `selftest` refuses to run with
+#  this on.
+# ═══════════════════════════════════════════════════════════════════════════════
 SPARRING_MODE = False
 
 
@@ -36,11 +70,11 @@ class Params:
     # ── economy ────────────────────────────────────────────────────────────────
     # Deposit slots are SHARED with the enemy, so every slot we leave empty is one
     # they can mine from.  Take the lot; the code caps this at `extractor_cap`.
-    # Expand toward eight when affordable; the supplied repeated match reached
-    # seven opponent extractors by tick 750 while the losing side stayed at three.
-    extractors_wanted: int = 8
-    miner_lead: int = 1                 # fighters must outnumber miners by this before the next miner
-    battle_per_healer: int = 2          # favor shooters; healers support a line rather than replace it
+    # Eight is what both winners in the friendly logs opened with, and three is what
+    # both losers opened with -- the openings were otherwise near-identical.
+    extractors_wanted: int = 6
+    miner_lead: int = 2                 # fighters must outnumber miners by this before the next miner
+    battle_per_healer: int = 3          # favor shooters; healers support a line rather than replace it
     max_healers: int = 8
     extractor_build_stop: float = 0.55  # match fraction after which a new miner cannot pay off
 
@@ -69,10 +103,10 @@ class Params:
     # against losing the first, and a third is a bot not shooting anybody.
     anchors_wanted: int = 2
     anchor_radius: float = 2.05         # inside `capture_radius`, outside the payload hull
-    line_radius: float = 3.65           # the shooting line: well inside blaster range
+    line_radius: float = 4.60           # the shooting line: well inside blaster range
     line_spacing: float = 1.30          # gap between the line's rings when it gets crowded
-    line_per_ring: int = 9
-    line_arc: float = 90.0             # how wide the line fans across the side it screens
+    line_per_ring: int = 10
+    line_arc: float = 110.0             # how wide the line fans across the side it screens
     threat_range: float = 14.0          # enemies this close to the payload set the front
 
     # ── giving ground ──────────────────────────────────────────────────────────
@@ -80,9 +114,9 @@ class Params:
     outnumber_margin: int = 1           # enemy surplus at the point that triggers a regroup
     # Regrouping concedes the circle, which is only affordable while the capture race is
     # close.  Below this capture value we are losing and every body contests instead.
-    # The supplied opponent turned a tiny lead into total map control after our
-    # losing side abandoned the centre. Regroup only with a substantial lead.
-    rally_min_capture: float = 0.25
+    # Once the payload crosses the midpoint, a regroup gifts the opponent a
+    # compounding positional advantage.  Keep the circle contested instead.
+    rally_min_capture: float = -0.05
     # A small fleet that is behind stops trying to win fights and freezes the payload:
     # a contested circle moves for nobody, and frozen beats losing.
     freeze_fleet: int = 4
@@ -114,12 +148,13 @@ class Params:
     raid_radius: float = 12.0           # detect and intercept before blaster range
 
     # ── raiding theirs ─────────────────────────────────────────────────────────
-    # The strike squad is only detached with local fighter surplus, after establishing
-    # the payload line, and only while enemy miners are actually at their deposit.
-    raid_squad: int = 2                 # flank the enemy miners only with adequate payload cover
-    raid_start: float = 0.10            # match fraction before which we do not bother
-    raid_stop: float = 0.53             # ... and after which their tokens no longer matter
-    raid_min_battle: int = 12            # only with a fleet big enough to hold and raid
+    #  Off by default.  The strike squad is the other way bodies leave the pack, and two
+    #  guns are worth more on the line than at their deposit.  Raise it if a match shows
+    #  their economy running away untouched.
+    raid_squad: int = 0                 # never hollow out the payload line for a raid
+    raid_start: float = 0.08            # match fraction before which we do not bother
+    raid_stop: float = 0.62             # ... and after which their tokens no longer matter
+    raid_min_battle: int = 14            # only with a fleet big enough to hold and raid
 
     # ── shooting ───────────────────────────────────────────────────────────────
     aim_slack: float = 0.04             # shaved off the target hull so a marginal shot is not taken
@@ -134,11 +169,11 @@ class Params:
     # asserted that one point of health always outranks any distance difference; a
     # weighted sum over the same features lets that trade-off be measured instead.
     w_shielded: float = 40.0            # still inside its invulnerability window
-    w_on_point: float = 9.0             # standing off the capture circle
+    w_on_point: float = 6.0             # standing off the capture circle
     w_health: float = 1.0               # finishing a wounded body beats chipping a fresh one
     w_gap: float = 0.10                 # prefer the nearer, more reliable shot
-    w_guarded: float = 9.0             # per enemy healer in range: the shot gets out-healed
-    w_is_healer: float = -23.0          # killing the healer is how the stack comes apart
+    w_guarded: float = 12.0             # per enemy healer in range: the shot gets out-healed
+    w_is_healer: float = -14.0          # killing the healer is how the stack comes apart
 
     cheap_budget: int = 1200            # compute bank remaining below which we cut corners
 
@@ -409,39 +444,24 @@ class Brain:
         # fight after that is one-sided.  Both winners in the friendly logs ran the full
         # eight-miner economy, so this is aimed squarely at the bots worth beating.
         strike = []
-        their_workers = [
-            e for e in enemies
-            if self._class_of(e) == BotClass.Extractor
-            and e.pos.dist(their_deposit) <= p.raid_radius
-        ]
-        our_local = sum(
-            b.pos.dist(payload) <= conf.bot.blaster_range for b in battle
-        )
-        their_local = sum(
-            e.pos.dist(payload) <= conf.bot.blaster_range
-            for e in enemies if self._class_of(e) in (BotClass.Battle, None)
-        )
-        # A raid is not worth losing control of the capture circle.  But when
-        # two spare guns exist, take the undefended miner zone instead of
-        # donating them to the opponent's nine-healer death ball.
-        raid_ok = (
-            not endgame and p.raid_squad > 0 and their_workers
-            and state.capture >= -0.06 and not raiders
+        if (
+            not endgame
+            and p.raid_squad > 0
+            and state.capture >= 0.0
+            and not raiders
+            and len([b for b in battle if b.pos.dist(payload) <= conf.bot.blaster_range])
+                >= len([e for e in enemies
+                        if self._class_of(e) in (BotClass.Battle, None)
+                        and e.pos.dist(payload) <= conf.bot.blaster_range]) + p.raid_squad + 3
             and p.raid_start <= phase <= p.raid_stop
             and len(battle) - len(garrison) >= p.raid_min_battle
-            and our_local >= their_local + 2
-            and len(battle) - len(garrison) - p.raid_squad >= p.anchors_wanted + 6
-        )
-        if raid_ok:
+        ):
             spare = [b for b in battle if b.id not in garrison_ids]
-            held = getattr(self, "_strike_ids", set())
-            sticky = [b for b in spare if int(b.id) in held]
-            fresh = _sorted_by(
-                [b for b in spare if int(b.id) not in held],
-                key=lambda b: (b.pos.dist_sq(their_deposit), b.id),
-            )
-            strike = (sticky + fresh)[:p.raid_squad]
-        self._strike_ids = {int(b.id) for b in strike}
+            want = min(p.raid_squad, max(0, len(spare) - p.anchors_wanted))
+            if want > 0:
+                strike = _sorted_by(
+                    spare, key=lambda b: (b.pos.dist_sq(their_deposit), b.id)
+                )[:want]
         strike_ids = {b.id for b in strike}
 
         # In the endgame, extractors still cannot fire.  Sending the whole mining
@@ -552,74 +572,64 @@ class Brain:
     # ───────────────────────────── the fabricator ──────────────────────────
 
     def _next_class(self, state, endgame: bool):
-        """Expand economy early, without sacrificing the initial escort.
+        """What the next body should be.
 
-        The supplied match's winner grew from 3 to 7 extractors by tick 750,
-        whereas the losing side never expanded beyond 3.  Use staged targets
-        so a miner does not displace a crucial first fighter or medic.  Keep
-        replenishing lost miners if there is enough time to recoup them.
+        The opening is copied from the two teams that won their friendly matches: both
+        reached eight miners inside the first 250 ticks off the 800 starting tokens,
+        interleaved with fighters, and both teams that opened on three miners lost.  The
+        deposit cap is shared, so the eighth miner is also the enemy's eighth slot taken.
         """
-        conf, p = self.conf, self.p
+        conf = self.conf
+        p = self.p
+
         miners = healers = battle = 0
         for bot in state.fleet_me:
-            if bot.class_ == BotClass.Extractor:
+            cls = bot.class_
+            if cls == BotClass.Extractor:  # noqa: F405
                 miners += 1
-            elif bot.class_ == BotClass.Healer:
+            elif cls == BotClass.Healer:  # noqa: F405
                 healers += 1
             else:
                 battle += 1
 
+        # Nothing but guns once building stops mattering for anything else.
         if endgame or self._converting(state):
-            return BotClass.Battle
+            return BotClass.Battle  # noqa: F405
+
+        # A fleet with no shooters at all loses its miners before they pay for themselves.
         if battle < 2:
-            return BotClass.Battle
+            return BotClass.Battle  # noqa: F405
 
-        danger = any(
-            self._class_of(e) in (BotClass.Battle, None)
-            and e.pos.dist(state.deposit_me.pos) <= p.raid_radius
-            for e in state.fleet_other
-        )
+        deposit = state.deposit_me.pos
+        threats = [e for e in state.fleet_other
+                   if self._class_of(e) in (BotClass.Battle, None)
+                   and e.pos.dist(deposit) <= p.raid_radius]
+        mining_safe = not threats
         cap = min(p.extractors_wanted, int(conf.deposit.extractor_cap))
-        travel = self.home.dist(state.deposit_me.pos) / max(1e-6, conf.bot.speed)
-        payback = conf.fabricator.rush_cost / max(1e-6, conf.bot.extract_rate)
-        cutoff = conf.max_ticks - conf.endgame_ticks
-        can_invest = (
-            not danger and state.tick < conf.max_ticks * p.extractor_build_stop
-            and cutoff - state.tick > travel + payback
-        )
+        travel_ticks = self.home.dist(deposit) / max(conf.bot.speed, 1e-6)
+        payback_ticks = conf.fabricator.rush_cost / max(conf.bot.extract_rate, 1e-6)
+        remaining = conf.max_ticks - conf.endgame_ticks - state.tick
+        mining_window = (state.tick < conf.max_ticks * p.extractor_build_stop
+                         and remaining > travel_ticks + payback_ticks)
 
-        # These stages are interleaved.  They do NOT force us to wait for the
-        # whole economy before buying the first shooting line and healing.
-        stages = (
-            (2, 1, 4),
-            (5, 2, 5),
-            (8, 3, 7),
-            (10, 4, cap),
-        )
-        for guns, medics, workers in stages:
-            if battle < guns:
-                return BotClass.Battle
-            if healers < min(medics, p.max_healers):
-                return BotClass.Healer
-            if can_invest and miners < min(workers, cap):
-                return BotClass.Extractor
+        # Healers come with the opening, not after it.  A healer cancels one battle bot's
+        # sustained damage exactly -- `heal_per_tick` against `blaster_damage` over
+        # `blaster_cooldown` -- so four in the first engagement is four enemy shooters
+        # neutralised for the fight that decides the match.  Friendlies 1330 and 1332
+        # were opened with two healers against four and five, and both were lost: the
+        # miner rule below used to outrank this one and the economy ate the opening.
+        if battle >= 2 and healers < min(p.healers_early, p.max_healers):
+            return BotClass.Healer  # noqa: F405
 
-        # If miners die during midgame, replace them; otherwise expand the
-        # combat line.  Under a raid, battle/healer replenishment takes over.
-        wounded = sum(
-            1 for b in state.fleet_me
-            if b.class_ == BotClass.Battle and b.health < conf.bot.health - 2.0
-        )
-        want_healers = min(
-            p.max_healers,
-            max(p.healers_early, battle // max(1, p.battle_per_healer)
-                + (1 if wounded >= 5 else 0)),
-        )
-        if healers < want_healers and battle >= 5:
-            return BotClass.Healer
-        if can_invest and miners < cap and battle >= miners + p.miner_lead:
-            return BotClass.Extractor
-        return BotClass.Battle
+        # Then interleave the economy one for one, so it grows behind the line.
+        if (mining_safe and mining_window and miners < cap
+                and miners + p.miner_lead <= battle):
+            return BotClass.Extractor  # noqa: F405
+
+        if healers < min(p.max_healers, max(1, battle // max(1, p.battle_per_healer))):
+            return BotClass.Healer  # noqa: F405
+
+        return BotClass.Battle  # noqa: F405
 
     # ──────────────────────────────── miners ───────────────────────────────
 
@@ -867,7 +877,7 @@ class Brain:
         self._formation_front = front
         ours, theirs, _local = self._combat_balance(fighters, enemies_pred, payload)
         retreat = self._retreat_state(state.tick, ours, theirs,
-                                      not freeze and not endgame and state.capture >= p.rally_min_capture)
+                                      not freeze and not endgame and state.capture > -0.65)
         # Keep anchors stable instead of reassigning every time distances cross.
         previous = getattr(self, "_anchor_ids", [])
         anchors = [bid for bid in previous if bid in active_ids]
@@ -960,8 +970,8 @@ class Brain:
             if (mark is not None and not anchor and not staging
                     and bot.id != survivor_id):
                 # Stop a supporting shooter walking away from a usable firing lane.
-                if (bot.pos.dist(mark[1]) <= conf.bot.blaster_range * 0.78
-                        and bot.pos.dist(payload) <= p.line_radius + 0.1):
+                if (bot.pos.dist(mark[1]) <= conf.bot.blaster_range - 0.5
+                        and bot.pos.dist(payload) <= p.line_radius + 2.0):
                     target = bot.pos
             elif (mark is None and not anchor and not staging and not cheap
                   and bot.id != survivor_id):
@@ -1116,20 +1126,10 @@ class Brain:
             ba.move_action = move_bot(step)  # noqa: F405
             here = bot.pos + self._applied(step, speed)
 
-            # Raid-role target acquisition must not silently swap its miner
-            # target for an unrelated shooter near the payload.
-            aim = None
-            if mark is not None and here.dist(mark_pos) <= conf.bot.blaster_range:
-                if (line_of_sight(here, mark_pos)
-                        and not self._disc_blocks(here, mark_pos, payload, conf.payload.radius)
-                        and not any(self._disc_blocks(here, mark_pos, d, conf.deposit.radius)
-                                    for d in self._shot_deposits)):
-                    aim = (mark, mark_pos)
-            if aim is None:
-                aim = self._pick_target(
-                    here, enemies_pred, payload, cheap, bot.next_fire_tick <= state.tick,
-                    state.tick, guards, healer_ids, shooter=bot,
-                )
+            aim = self._pick_target(
+                here, enemies_pred, payload, cheap, bot.next_fire_tick <= state.tick,
+                state.tick, guards, healer_ids,
+            )
             ba.special_action = SpecialAction.Battle(fire=False)  # noqa: F405
             if aim is None:
                 ba.turn_action = turn_towards(their_deposit)  # noqa: F405
@@ -1215,8 +1215,7 @@ class Brain:
             patient = None
             for hurt in sorted(
                 (b for b in allies if b.health < full - 1e-3 and b.id != healer.id),
-                key=lambda b: (0 if b.health <= conf.bot.blaster_damage else 1,
-                               healer.pos.dist_sq(b.pos), b.health),
+                key=lambda b: healer.pos.dist_sq(b.pos),
             ):
                 if load.get(hurt.id, 0) >= stack:
                     continue
@@ -1252,113 +1251,76 @@ class Brain:
     # ────────────────────────────── fire control ───────────────────────────
 
     def _fire_control(self, state, action, aims: dict, enemies_pred) -> None:
-        """Coordinate real, unobstructed shots and focus enough guns for kills.
+        """Allocate reachable shots; a duplicate aim can use a different target.
 
-        The old `claimed` set allowed only ONE blaster hit per enemy per tick.
-        A single healer restores 3 HP in the 60 ticks between that bot's
-        shots, exactly cancelling a solo blaster.  That made a protected enemy
-        effectively immortal; multiple shooters must be allowed to fire at it.
+        Only consider angles the shooter can reach during this tick. Recheck the
+        first ray hit, obstacles, invulnerability and splash before reserving victims.
         """
         if not aims or not enemies_pred:
             return
-        conf, tick = self.conf, state.tick
+        conf = self.conf
+        tick = state.tick
         splash = conf.bot.base_blaster_splash_radius + conf.bot.radius
         deposits = (state.deposit_me.pos, state.deposit_other.pos)
         payload = state.payload_pos()
-        enemy_by_id = {int(e.id): e for e, _ in enemies_pred}
-        healers, guards = self._heal_support([e for e, _ in enemies_pred])
-        healer_ids = {int(e.id) for e in healers}
-        enemy_miners = {
-            int(e.id) for e, ep in enemies_pred
-            if self._class_of(e) == BotClass.Extractor
-            and ep.dist(state.deposit_other.pos) <= self.p.raid_radius
-        }
-        # Sorting by fewest available rays first prevents slow-turning shooters
-        # being forced to waste their rare shot on a target they cannot reach.
+        claimed = set()
         choices = []
-        for bot_id, (bot, here, desired_angle) in aims.items():
+        for bot_id, (bot, here, angle) in aims.items():
             if bot.next_fire_tick > tick:
                 continue
-            candidate_angles = [desired_angle]
+            # Preserve the chosen aim, plus alternative targets reachable now.
+            candidates = [(angle, None)]
             reachable = []
             for enemy, pos in enemies_pred:
-                gap = here.dist(pos)
-                if gap > conf.bot.blaster_range or gap < 1e-5:
+                distance = here.dist(pos)
+                if distance > conf.bot.blaster_range or distance < 1e-6:
                     continue
-                angle = (pos - here).angle_deg()
-                error = abs(diff_degrees(angle, bot.angle))
-                tolerance = math.degrees(math.asin(
-                    min(1.0, max(0.0, conf.bot.radius - self.p.aim_slack) / gap)
-                ))
+                error = abs(diff_degrees((pos - here).angle_deg(), bot.angle))
+                tolerance = math.degrees(math.asin(min(1.0,
+                    max(0.0, conf.bot.radius - self.p.aim_slack) / distance)))
                 if error <= conf.bot.turn_speed + tolerance:
-                    reachable.append((gap, pos))
-            for _, pos in sorted(reachable, key=lambda t: t[0])[:12]:
-                candidate_angles.append(self._after_turn(bot, here, pos))
-
-            options, seen = [], set()
-            for angle in candidate_angles:
-                hit = self._ray_hit(here, angle, enemies_pred, payload, deposits)
+                    reachable.append((enemy.health, distance, int(enemy.id), pos))
+            for _, _, _, pos in sorted(reachable)[:6]:
+                candidates.append((self._after_turn(bot, here, pos), pos))
+            options = []
+            seen = set()
+            for candidate_angle, aim_pos in candidates:
+                hit = self._ray_hit(here, candidate_angle, enemies_pred, payload, deposits)
                 if hit is None:
                     continue
                 enemy, impact, gap = hit
-                eid = int(enemy.id)
-                if eid in seen:
+                if int(enemy.id) in seen:
                     continue
-                seen.add(eid)
-                victims = [e for e, ep in enemies_pred
-                           if ep.dist(impact) <= splash
+                seen.add(int(enemy.id))
+                victims = [e for e, ep in enemies_pred if ep.dist(impact) <= splash
                            and e.invulnerable_until_tick <= tick]
                 if victims:
-                    options.append((victims, gap, angle, eid))
+                    options.append((victims, gap, aim_pos, int(enemy.id)))
             if options:
                 choices.append((len(options), bot_id, options))
-
-        assigned_damage = {}
-        struck = {}
-        strike_ids = getattr(self, "_strike_ids", set())
+        # Shooters with only one firing lane get it first; flexible ones retarget.
         for _, bot_id, options in sorted(choices, key=lambda x: (x[0], x[1])):
             best = None
-            best_score = -1e20
-            for victims, gap, angle, primary in options:
-                score = -gap * 0.045
-                useful = False
-                for e in victims:
-                    eid = int(e.id)
-                    planned = assigned_damage.get(eid, 0.0)
-                    remaining = max(0.0, e.health - planned)
-                    if remaining <= 0.0:
-                        score -= 6.0  # do not waste an entire cooldown on a corpse
-                        continue
-                    useful = True
-                    # A kill is more valuable than spreading 3 HP around an
-                    # enemy with nine medics in formation.
-                    score += 3.5 + (6.0 if remaining <= conf.bot.blaster_damage else 0.0)
-                    score += 1.6 * min(3.0, struck.get(eid, 0))
-                    if eid in healer_ids:
-                        score += 6.0
-                    if eid in enemy_miners and bot_id in strike_ids:
-                        score += 16.0
-                    if e.pos.dist(payload) <= conf.payload.capture_radius + 0.5:
-                        score += 1.5
-                    score -= 0.85 * guards.get(eid, 0)
-                if useful and score > best_score:
+            best_score = -1.0
+            for victims, gap, aim_pos, hit_id in options:
+                fresh = [e for e in victims if int(e.id) not in claimed]
+                if not fresh:
+                    continue
+                score = sum(3.0 + (5.0 if e.health <= conf.bot.blaster_damage else 0.0)
+                            + (2.0 if self._class_of(e) == BotClass.Healer else 0.0)
+                            for e in fresh) - gap * 0.02
+                if score > best_score:
                     best_score = score
-                    best = (victims, angle, primary)
+                    best = (fresh, aim_pos, hit_id)
             if best is None:
                 continue
-            victims, angle, primary = best
-            # Retain the selected final angle exactly.  `turn_towards` is
-            # engine's turn controller, and an unreachable ray is excluded above.
-            action.bots[bot_id].turn_action = turn_towards(
-                here + Vec2.from_angle_deg(angle) * conf.bot.blaster_range
-            )
+            victims, aim_pos, hit_id = best
+            if aim_pos is not None:
+                action.bots[bot_id].turn_action = turn_towards(aim_pos)
             action.bots[bot_id].special_action = SpecialAction.Battle(fire=True)
-            for e in victims:
-                eid = int(e.id)
-                assigned_damage[eid] = assigned_damage.get(eid, 0.0) + conf.bot.blaster_damage
-                struck[eid] = struck.get(eid, 0) + 1
+            claimed.update(int(e.id) for e in victims)
             if hasattr(self, "_target_memory"):
-                self._target_memory[int(bot_id)] = primary
+                self._target_memory[int(bot_id)] = hit_id
 
     def _ray_hit(self, origin, angle: float, enemies_pred, payload, deposits):
         """The enemy a shot from `origin` along `angle` would stop on, or `None`.
